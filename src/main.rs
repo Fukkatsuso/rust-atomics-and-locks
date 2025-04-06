@@ -1,6 +1,8 @@
 use std::thread;
 
-use rust_atomics_and_locks::SpinLock;
+use spinlock::SpinLock;
+
+mod spinlock;
 
 fn main() {
     let x = SpinLock::new(Vec::new());
