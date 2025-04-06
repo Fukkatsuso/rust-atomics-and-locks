@@ -1,13 +1,14 @@
 use std::thread;
 
-use channel::channel;
+use channel::Channel;
 
 mod channel;
 mod spinlock;
 
 fn main() {
+    let mut channel = Channel::new();
     thread::scope(|s| {
-        let (sender, receiver) = channel();
+        let (sender, receiver) = channel.split();
         let t = thread::current();
         s.spawn(move || {
             sender.send("hello world!");
