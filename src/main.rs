@@ -1,20 +1,22 @@
 use std::thread;
 
-use spinlock::SpinLock;
+use channel::Channel;
 
 mod channel;
 mod spinlock;
 
 fn main() {
-    let x = SpinLock::new(Vec::new());
+    let channel = Channel::new();
+    let t = thread::current();
     thread::scope(|s| {
-        s.spawn(|| x.lock().push(1));
         s.spawn(|| {
-            let mut g = x.lock();
-            g.push(2);
-            g.push(2);
+            channel.send("hello world!");
+            t.unpark();
         });
+        while !channel.is_ready() {
+            thread::park();
+        }
+        assert_eq!(channel.receive(), "hello world!");
+        // assert_eq!(channel.receive(), "hello world!"); // panic!
     });
-    let g = x.lock();
-    assert!(g.as_slice() == [1, 2, 2] || g.as_slice() == [2, 2, 1]);
 }
