@@ -2,6 +2,7 @@ use std::thread;
 
 use spinlock::SpinLock;
 
+mod channel;
 mod spinlock;
 
 fn main() {
