@@ -1,13 +1,17 @@
+use std::marker::PhantomData;
+use std::thread::{self, Thread};
 use std::{cell::UnsafeCell, mem::MaybeUninit, sync::atomic::AtomicBool};
 
 use std::sync::atomic::Ordering::*;
 
 pub struct Sender<'a, T> {
     channel: &'a Channel<T>,
+    receiving_thread: Thread,
 }
 
 pub struct Receiver<'a, T> {
     channel: &'a Channel<T>,
+    _no_send: PhantomData<*const ()>,
 }
 
 pub struct Channel<T> {
@@ -33,7 +37,16 @@ impl<T> Channel<T> {
         // 排他参照で受け取った self を 2 つの共有参照に分割し、Sender 型と Receiver 型でラップ
         // Self::new で新たな空のチャネルを作って上書きすることで、古いチャネルをドロップし、未定義動作を防ぐ
         *self = Self::new();
-        (Sender { channel: self }, Receiver { channel: self })
+        (
+            Sender {
+                channel: self,
+                receiving_thread: thread::current(), // 受信スレッドは現在のスレッドに留まる
+            },
+            Receiver {
+                channel: self,
+                _no_send: PhantomData,
+            },
+        )
     }
 }
 
@@ -41,17 +54,15 @@ impl<T> Sender<'_, T> {
     pub fn send(self, message: T) {
         unsafe { (*self.channel.message.get()).write(message) };
         self.channel.ready.store(true, Release);
+        self.receiving_thread.unpark();
     }
 }
 
 impl<T> Receiver<'_, T> {
-    pub fn is_ready(&self) -> bool {
-        self.channel.ready.load(Relaxed)
-    }
-
     pub fn receive(self) -> T {
-        if !self.channel.ready.swap(false, Acquire) {
-            panic!("no message available!");
+        // send 以外の誰かが unpark することもありうるため、ready フラグによるチェックが必要
+        while !self.channel.ready.swap(false, Acquire) {
+            thread::park();
         }
         unsafe { (*self.channel.message.get()).assume_init_read() }
     }
