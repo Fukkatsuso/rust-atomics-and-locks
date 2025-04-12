@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{fence, Ordering::*};
 use std::usize;
 use std::{ops::Deref, ptr::NonNull, sync::atomic::AtomicUsize};
@@ -6,15 +7,18 @@ use std::{ops::Deref, ptr::NonNull, sync::atomic::AtomicUsize};
 struct ArcData<T> {
     /// `Arc` の数
     data_ref_count: AtomicUsize,
-    /// 'Arc` と `Weak` の数を足したもの
+    /// `Weak` の数。`Arc` が 1 つでもあればさらに 1 足す
     alloc_ref_count: AtomicUsize,
-    /// データ本体。weak ポインタしか残っていなければ `None` になる
-    data: UnsafeCell<Option<T>>,
+    /// データ本体。weak ポインタしかなくなったらドロップされる
+    data: UnsafeCell<ManuallyDrop<T>>,
 }
 
 pub struct Arc<T> {
-    weak: Weak<T>,
+    ptr: NonNull<ArcData<T>>,
 }
+
+unsafe impl<T: Send + Sync> Send for Arc<T> {}
+unsafe impl<T: Send + Sync> Sync for Arc<T> {}
 
 pub struct Weak<T> {
     ptr: NonNull<ArcData<T>>,
@@ -26,34 +30,63 @@ unsafe impl<T: Send + Sync> Sync for Weak<T> {}
 impl<T> Arc<T> {
     pub fn new(data: T) -> Arc<T> {
         Arc {
-            weak: Weak {
-                ptr: NonNull::from(Box::leak(Box::new(ArcData {
-                    alloc_ref_count: AtomicUsize::new(1),
-                    data_ref_count: AtomicUsize::new(1),
-                    data: UnsafeCell::new(Some(data)),
-                }))),
-            },
+            ptr: NonNull::from(Box::leak(Box::new(ArcData {
+                alloc_ref_count: AtomicUsize::new(1),
+                data_ref_count: AtomicUsize::new(1),
+                data: UnsafeCell::new(ManuallyDrop::new(data)),
+            }))),
         }
+    }
+
+    fn data(&self) -> &ArcData<T> {
+        unsafe { self.ptr.as_ref() }
     }
 
     pub fn get_mut(arc: &mut Self) -> Option<&mut T> {
-        if arc.weak.data().alloc_ref_count.load(Relaxed) == 1 {
-            fence(Acquire);
-            // 安全性:Arc は 1 つしかないし weak ポインタはないので、他の何もデータにアクセスできない。
-            // その Arc に対してこのスレッドが排他アクセス権限を持っている。
-            let arcdata = unsafe { arc.weak.ptr.as_mut() };
-            let option = arcdata.data.get_mut();
-            // Arc があるのでデータがまだ利用できることがわかっている。
-            // したがってここでパニックすることはない
-            let data = option.as_mut().unwrap();
-            Some(data)
-        } else {
-            None
+        // Acquire は Weak::drop の Release デクリメントと対応する。
+        // アップグレードされた weak があれば、次の data_ref_count.load で観測できるようにするため。
+        if arc
+            .data()
+            .alloc_ref_count
+            .compare_exchange(1, usize::MAX, Acquire, Relaxed)
+            .is_err()
+        {
+            return None;
         }
+        let is_unique = arc.data().data_ref_count.load(Relaxed) == 1;
+        // Release は `downgrade` の Acquire インクリメントに対応する。
+        // `downgrade` 以降の data_ref_count への何らかの変更が、
+        // 上の is_unique の結果に影響しないようにするため。
+        arc.data().alloc_ref_count.store(1, Release);
+        if !is_unique {
+            return None;
+        }
+        // Acquire は Arc::drop の Release デクリメントに対応。
+        // 他の何もデータにアクセスしていないことを保証するため。
+        fence(Acquire);
+        unsafe { Some(&mut *arc.data().data.get()) }
     }
 
     pub fn downgrade(arc: &Self) -> Weak<T> {
-        arc.weak.clone()
+        let mut n = arc.data().alloc_ref_count.load(Relaxed);
+        loop {
+            if n == usize::MAX {
+                std::hint::spin_loop();
+                n = arc.data().alloc_ref_count.load(Relaxed);
+                continue;
+            }
+            assert!(n < usize::MAX - 1);
+            // Acquire は get_mut の Release ストアと同期
+            if let Err(e) =
+                arc.data()
+                    .alloc_ref_count
+                    .compare_exchange_weak(n, n + 1, Acquire, Relaxed)
+            {
+                n = e;
+                continue;
+            }
+            return Weak { ptr: arc.ptr };
+        }
     }
 }
 
@@ -79,7 +112,7 @@ impl<T> Weak<T> {
                 n = e;
                 continue;
             }
-            return Some(Arc { weak: self.clone() });
+            return Some(Arc { ptr: self.ptr });
         }
     }
 }
@@ -88,20 +121,18 @@ impl<T> Deref for Arc<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        let ptr = self.weak.data().data.get();
-        // 安全性:データに対する Arc があるので、
-        // データは存在するし、共有されているかもしれない。
-        unsafe { (*ptr).as_ref().unwrap() }
+        // 安全性:データに対する Arc が存在するので、
+        // データは存在し、共有されている可能性もある。
+        unsafe { &*self.data().data.get() }
     }
 }
 
 impl<T> Clone for Arc<T> {
     fn clone(&self) -> Self {
-        let weak = self.weak.clone();
-        if weak.data().data_ref_count.fetch_add(1, Relaxed) > usize::MAX / 2 {
+        if self.data().data_ref_count.fetch_add(1, Relaxed) > usize::MAX / 2 {
             std::process::abort();
         }
-        Arc { weak }
+        Arc { ptr: self.ptr }
     }
 }
 
@@ -116,14 +147,16 @@ impl<T> Clone for Weak<T> {
 
 impl<T> Drop for Arc<T> {
     fn drop(&mut self) {
-        if self.weak.data().data_ref_count.fetch_sub(1, Release) == 1 {
+        if self.data().data_ref_count.fetch_sub(1, Release) == 1 {
             fence(Acquire);
-            let ptr = self.weak.data().data.get();
             // 安全性:データへの参照カウントはゼロなので、
             // 他の場所からアクセスすることはない。
             unsafe {
-                (*ptr) = None;
+                ManuallyDrop::drop(&mut *self.data().data.get());
             }
+            // `Arc<T>` が残っていないので、すべての `Arc<T>` を代表していた暗黙の weak ポインタをドロップする
+            // （デクリメントのため）
+            drop(Weak { ptr: self.ptr });
         }
     }
 }
