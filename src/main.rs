@@ -2,6 +2,7 @@ use std::thread;
 
 use channel::Channel;
 
+mod arc;
 mod channel;
 mod spinlock;
 
