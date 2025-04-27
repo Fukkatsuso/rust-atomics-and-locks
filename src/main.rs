@@ -1,6 +1,6 @@
-use std::thread;
+use std::{thread, time::Instant};
 
-use channel::Channel;
+use lock::Mutex;
 
 mod arc;
 mod channel;
@@ -8,14 +8,18 @@ mod lock;
 mod spinlock;
 
 fn main() {
-    let mut channel = Channel::new();
+    let m = Mutex::new(0);
+    std::hint::black_box(&m);
+    let start = Instant::now();
     thread::scope(|s| {
-        let (sender, receiver) = channel.split();
-        s.spawn(move || {
-            sender.send("hello world!");
-            // sender.send("hello world!"); // compile error!
-        });
-        assert_eq!(receiver.receive(), "hello world!");
-        // assert_eq!(receiver.receive(), "hello world!"); // compile error!
+        for _ in 0..4 {
+            s.spawn(|| {
+                for _ in 0..5_000_000 {
+                    *m.lock() += 1;
+                }
+            });
+        }
     });
+    let duration = start.elapsed();
+    println!("locked {} times in {:?}", *m.lock(), duration);
 }
