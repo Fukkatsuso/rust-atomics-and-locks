@@ -165,6 +165,8 @@ fn test_condvar() {
 pub struct RwLock<T> {
     /// リーダの数。ライトロックされている場合には u32::MAX
     state: AtomicU32,
+    /// ライタを起こす際にインクリメントする
+    writer_wake_counter: AtomicU32,
     value: UnsafeCell<T>,
 }
 
@@ -174,6 +176,7 @@ impl<T> RwLock<T> {
     pub const fn new(value: T) -> Self {
         Self {
             state: AtomicU32::new(0), // unlocked
+            writer_wake_counter: AtomicU32::new(0),
             value: UnsafeCell::new(value),
         }
     }
@@ -196,9 +199,18 @@ impl<T> RwLock<T> {
     }
 
     pub fn write(&self) -> WriteGuard<T> {
-        while let Err(s) = self.state.compare_exchange(0, u32::MAX, Acquire, Relaxed) {
-            // ロックされていたら待機する
-            wait(&self.state, s);
+        while self
+            .state
+            .compare_exchange(0, u32::MAX, Acquire, Relaxed)
+            .is_err()
+        {
+            // リーダのアンロック時の Release インクリメント操作と先行発生関係を結ぶ
+            let w = self.writer_wake_counter.load(Acquire);
+            if self.state.load(Relaxed) != 0 {
+                // RwLock がまだロックされていたら待機する
+                // ただしチェックした後で wake 通知が来ていない場合だけ
+                wait(&self.writer_wake_counter, w);
+            }
         }
         WriteGuard { rwlock: self }
     }
@@ -236,7 +248,8 @@ impl<T> Drop for ReadGuard<'_, T> {
     fn drop(&mut self) {
         if self.rwlock.state.fetch_sub(1, Release) == 1 {
             // state が 0 になるので、待機中のライタがいれば、それを起こす
-            wake_one(&self.rwlock.state);
+            self.rwlock.writer_wake_counter.fetch_add(1, Release);
+            wake_one(&self.rwlock.writer_wake_counter);
         }
     }
 }
@@ -244,8 +257,10 @@ impl<T> Drop for ReadGuard<'_, T> {
 impl<T> Drop for WriteGuard<'_, T> {
     fn drop(&mut self) {
         self.rwlock.state.store(0, Release);
-        // 待機しているライタを 1 つ、もしくはリーダをすべて起こす
+        self.rwlock.writer_wake_counter.fetch_add(1, Release);
+        // 待機しているライタを 1 つと、リーダをすべて起こす
         // 待機しているのがリーダなのかライタなのかわからないし、どちらかだけを起こすこともできないため、すべてのスレッドを起こす
+        wake_one(&self.rwlock.writer_wake_counter);
         wake_all(&self.rwlock.state);
     }
 }
