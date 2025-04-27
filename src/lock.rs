@@ -1,4 +1,4 @@
-use std::sync::atomic::Ordering::*;
+use std::sync::atomic::{AtomicUsize, Ordering::*};
 use std::thread;
 use std::time::Duration;
 use std::{
@@ -83,26 +83,38 @@ impl<T> Drop for MutexGuard<'_, T> {
 
 pub struct Condvar {
     counter: AtomicU32,
+    num_waiters: AtomicUsize,
 }
 
 impl Condvar {
     pub const fn new() -> Self {
         Self {
             counter: AtomicU32::new(0),
+            num_waiters: AtomicUsize::new(0),
         }
     }
 
     pub fn notify_one(&self) {
-        self.counter.fetch_add(1, Relaxed);
-        wake_one(&self.counter);
+        // (待機スレッドがいなければ何もしない)
+        if self.num_waiters.load(Relaxed) > 0 {
+            self.counter.fetch_add(1, Relaxed);
+            wake_one(&self.counter);
+        }
     }
 
     pub fn notify_all(&self) {
-        self.counter.fetch_add(1, Relaxed);
-        wake_all(&self.counter);
+        // (待機スレッドがいなければ何もしない)
+        if self.num_waiters.load(Relaxed) > 0 {
+            self.counter.fetch_add(1, Relaxed);
+            wake_all(&self.counter);
+        }
     }
 
     pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        // 別スレッドからの num_waiters に対するロードは、Mutex 解放後に起こる
+        // よって、インクリメント前の値が観測されることはない (下のインクリメントは Relaxed で良い)
+        self.num_waiters.fetch_add(1, Relaxed);
+
         let counter_value = self.counter.load(Relaxed);
 
         // ガードをドロップすることで、Mutex をアンロックする
@@ -112,6 +124,11 @@ impl Condvar {
 
         // カウンタ値がアンロックする前から変更されていない場合にだけ待機する
         wait(&self.counter, counter_value);
+
+        // 通知 → スレッドが起こされた → デクリメント
+        // という流れなので、通知スレッドがデクリメント後の値を観測することはない = num_waiters がゼロになって起こされない、という心配がない
+        // （たぶんそういう意味）
+        self.num_waiters.fetch_sub(1, Relaxed);
 
         mutex.lock()
     }
