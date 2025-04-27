@@ -163,7 +163,11 @@ fn test_condvar() {
 }
 
 pub struct RwLock<T> {
-    /// リーダの数。ライトロックされている場合には u32::MAX
+    /// リードロックの数を 2 倍し、ライタが待機していた 1 足した値
+    /// ライトロックされていたら u32::MAX
+    ///
+    /// したがって、リーダは state が偶数ならロックを取得でき、
+    /// 奇数ならブロックする
     state: AtomicU32,
     /// ライタを起こす際にインクリメントする
     writer_wake_counter: AtomicU32,
@@ -184,35 +188,53 @@ impl<T> RwLock<T> {
     pub fn read(&self) -> ReadGuard<T> {
         let mut s = self.state.load(Relaxed);
         loop {
-            if s < u32::MAX {
-                assert!(s != u32::MAX - 1, "too many readers");
-                match self.state.compare_exchange_weak(s, s + 1, Acquire, Relaxed) {
+            // 偶数ならロック可能
+            if s % 2 == 0 {
+                assert!(s < u32::MAX - 2, "too many readers");
+                match self.state.compare_exchange_weak(s, s + 2, Acquire, Relaxed) {
                     Ok(_) => return ReadGuard { rwlock: self },
                     Err(e) => s = e,
                 }
             }
-            if s == u32::MAX {
-                wait(&self.state, u32::MAX);
+            // 奇数ならライタが待機中なのでリードロックを待たせる
+            if s % 2 == 1 {
+                wait(&self.state, s);
                 s = self.state.load(Relaxed);
             }
         }
     }
 
     pub fn write(&self) -> WriteGuard<T> {
-        while self
-            .state
-            .compare_exchange(0, u32::MAX, Acquire, Relaxed)
-            .is_err()
-        {
-            // リーダのアンロック時の Release インクリメント操作と先行発生関係を結ぶ
+        let mut s = self.state.load(Relaxed);
+        loop {
+            // アンロックされていたらロックを試みる
+            if s <= 1 {
+                match self.state.compare_exchange(s, u32::MAX, Acquire, Relaxed) {
+                    Ok(_) => return WriteGuard { rwlock: self },
+                    Err(e) => {
+                        s = e;
+                        continue;
+                    }
+                }
+            }
+            // (ロックが取れなかった場合) state を奇数にして、新しいリーダをブロックすることも必要
+            if s % 2 == 0 {
+                match self.state.compare_exchange(s, s + 1, Relaxed, Relaxed) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        s = e;
+                        continue;
+                    }
+                }
+            }
+            // まだロックされていたら待機
             let w = self.writer_wake_counter.load(Acquire);
-            if self.state.load(Relaxed) != 0 {
-                // RwLock がまだロックされていたら待機する
-                // ただしチェックした後で wake 通知が来ていない場合だけ
+            s = self.state.load(Relaxed);
+            if s >= 2 {
                 wait(&self.writer_wake_counter, w);
+                s = self.state.load(Relaxed);
             }
         }
-        WriteGuard { rwlock: self }
     }
 }
 
@@ -246,8 +268,11 @@ impl<T> Deref for ReadGuard<'_, T> {
 
 impl<T> Drop for ReadGuard<'_, T> {
     fn drop(&mut self) {
-        if self.rwlock.state.fetch_sub(1, Release) == 1 {
-            // state が 0 になるので、待機中のライタがいれば、それを起こす
+        // state を 2 減らして 1 つのリードロックを削除する
+        if self.rwlock.state.fetch_sub(2, Release) == 3 {
+            // state が 3 -> 1 になった場合には、RwLock がアンロックされ、
+            // 「かつ」待機中のライタがいることがわかる。
+            // よって、このライタを起こす。
             self.rwlock.writer_wake_counter.fetch_add(1, Release);
             wake_one(&self.rwlock.writer_wake_counter);
         }
