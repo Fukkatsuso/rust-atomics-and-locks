@@ -4,6 +4,7 @@ use channel::Channel;
 
 mod arc;
 mod channel;
+mod lock;
 mod spinlock;
 
 fn main() {
